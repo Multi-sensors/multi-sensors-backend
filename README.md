@@ -1,4 +1,4 @@
-# NavipetBackend
+# Multi-Sensors Backend
 
 FastAPI backend for the Multi-Sensors research platform.
 
