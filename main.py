@@ -9,3 +9,7 @@ async def index():
 @app.get('/about')
 async def about():
     return "Multi sensor research project backend"
+
+@app.get('/health')
+async def health():
+    return {"status": "ok"}
