@@ -33,3 +33,10 @@ def test_me_with_valid_token():
     response = client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     assert response.json() == {"user_id": "user-123", "email": "person@example.com"}
+
+
+def test_me_with_token_missing_email_claim():
+    payload = {"sub": "user-123", "aud": "authenticated"}
+    token = jwt.encode(payload, SUPABASE_JWT_SECRET, algorithm="HS256")
+    response = client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 401
