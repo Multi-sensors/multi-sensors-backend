@@ -1,65 +1,98 @@
 # Auth API Design
 
+> Status: spec. Only `GET /api/v1/me` on an HS256 shared secret exists today; the `/auth`
+> prefix, JWKS verification, login and reset described below are not built yet.
+
 ## 1. Architecture decision
 
-- **Auth method:** email + password.
-- **Frontend talks to Supabase Auth directly.** The backend never sees raw credentials.
-  Login, signup, and password reset are Supabase client calls made from the frontend —
-  they are not backend routes.
-- **Backend responsibility:** verify the Supabase-issued JWT on incoming requests and
-  gate protected routes. No password handling, no server-side session store.
-- **Sessions:** short-lived access token + refresh token, both issued and rotated by
-  Supabase (`supabase-js` handles rotation automatically on the frontend). The backend
-  verifies the access token per-request and is stateless.
-- **Users:** known research-team members only. Self-serve signup is out of scope unless
-  the team decides otherwise later.
+- **Email + password, single account.** No signup.
+- **Supabase Auth owns** credential verification, token issuance, refresh/rotation, and
+  password updates. **The frontend never calls Supabase auth methods directly:** login and
+  reset go through FastAPI; `supabase-js` only *holds* the session.
+- **FastAPI owns** the auth contract, JWT verification, and the sole-user check: `sub` must
+  equal `ALLOWED_SUPABASE_USER_ID` (exact UUID match).
 
 ```
-Frontend  --(email/password)-->  Supabase Auth
-Frontend  <--(access + refresh JWT)--  Supabase Auth
-Frontend  --(Authorization: Bearer <access JWT>)-->  FastAPI backend
-FastAPI backend  --(verify JWT signature/claims only, no call to Supabase)-->  200 / 401
+Frontend  --(email/password)-->  FastAPI  --> Supabase Auth
+Frontend  <--(access + refresh token)--  FastAPI   (403 if not the sole user)
+Frontend  --> supabase.auth.setSession(...)        (supabase-js handles refresh)
+Frontend  --(Authorization: Bearer <access token>)-->  FastAPI protected routes
 ```
 
-## 2. Backend contract
+## 2. Endpoints
 
-### `GET /api/v1/me`
+All under `/api/v1/auth`. Passwords are held in memory only — never logged or persisted.
 
-Proves token verification works end-to-end and serves as the template for future
-protected routes.
+### `POST /auth/login`
 
-**Request**
-
-```
-GET /api/v1/me
-Authorization: Bearer <supabase-access-token>
-```
-
-**Response — 200 OK**
+Request `{ "email": "owner@example.com", "password": "<password>" }`; **200 OK** returns the
+Supabase session, passed straight to `supabase.auth.setSession()`:
 
 ```json
 {
-  "user_id": "auth0-style-uuid-from-sub-claim",
-  "email": "person@example.com"
+  "access_token": "<supabase-access-token>",
+  "refresh_token": "<supabase-refresh-token>",
+  "token_type": "bearer",
+  "expires_in": 3600,
+  "user": { "id": "<supabase-user-uuid>", "email": "owner@example.com" }
 }
 ```
 
-**Response — 401 Unauthorized**
+`401` on bad credentials, `403` if the account is not `ALLOWED_SUPABASE_USER_ID`.
 
-Returned when the `Authorization` header is missing, malformed, or the token fails
-signature/expiry/audience verification. No other backend route requires auth yet.
+### `GET /auth/me`
 
-## 3. Note to frontend
+Send `Authorization: Bearer <access-token>`. Returns minimal identity only — no raw JWT,
+no extra claims: `{ "id": "<supabase-user-uuid>", "email": "owner@example.com" }`
 
-The backend does **not** expose login, signup, or reset-password endpoints — call
-Supabase directly from the frontend using `supabase-js`:
+### `POST /auth/reset-password`
 
-- `supabase.auth.signInWithPassword({ email, password })` — login
-- `supabase.auth.resetPasswordForEmail(email, { redirectTo })` — password reset request
-- `supabase.auth.signUp({ email, password })` — only if/when self-serve signup is turned on (currently out of scope)
+Authenticated password change: `Authorization: Bearer <current-access-token>` plus
+`{ "new_password": "...", "confirm_password": "..." }`. Returns **204 No Content** with an
+empty body; the update uses the caller's own access token, never the service-role key, and
+is rate limited. Afterwards the frontend confirms success, re-checks `/auth/me`, and
+continues to the dashboard — or clears state and returns to login if Supabase invalidated
+the session.
 
-After login, pass the session's `access_token` as a `Bearer` token to any backend route
-under `/api/v1/`. The only such route today is `GET /api/v1/me`.
+## 3. Error contract
 
-Once you build the reset-password page, send its URL to Daksha/Stephanie so it can be
-set as the redirect target in Supabase's password-reset email template.
+| Condition | Status | Public response |
+| --- | --- | --- |
+| Invalid login credentials | 401 | Invalid email or password |
+| Missing / malformed bearer token | 401 | Authentication required |
+| Invalid or expired access token | 401 | Invalid or expired session |
+| Authenticated but unapproved user | 403 | Account is not authorized |
+| Password mismatch or policy violation | 400 | Passwords do not match / generic policy message |
+
+Every bearer-auth 401 includes `WWW-Authenticate: Bearer`. Logs may carry a sanitized error
+category and correlation ID — never credentials, tokens, or sensitive claims.
+
+## 4. Token verification
+
+One shared dependency (`require_sole_user`) guards every protected route. It verifies the
+JWT against Supabase's JWKS (`<SUPABASE_URL>/auth/v1/.well-known/jwks.json`) using only the
+configured asymmetric algorithm — never the one from the token header — and checks `iss`
+(`<SUPABASE_URL>/auth/v1`), `aud`, `exp`, `sub`; keys are cached briefly and refetched on an
+unknown `kid`. Swagger's **Authorize** button takes the *access* token, never the refresh one.
+
+## 5. Note to frontend
+
+Login: submit to `POST /auth/login`, hand both tokens to `supabase.auth.setSession()`, then
+call `GET /auth/me`. Render protected content only after `/auth/me` succeeds, never while
+session restore is in flight; on any auth failure, clear protected state and return to login.
+Sign-out is `supabase.auth.signOut()` + clearing client state; no logout route, no custom refresh.
+
+## 6. Configuration
+
+```
+SUPABASE_URL=https://<project-ref>.supabase.co
+SUPABASE_PUBLISHABLE_KEY=<publishable-key>
+SUPABASE_JWT_AUDIENCE=authenticated
+ALLOWED_SUPABASE_USER_ID=<sole-user-uuid>
+FRONTEND_ORIGIN=https://<application-domain>
+```
+
+No service-role key, secret key, or legacy JWT secret in backend or frontend code. Every
+user-owned table carries `owner_id uuid NOT NULL REFERENCES auth.users(id)` with RLS scoped
+by `owner_id = auth.uid()`; forward the user's access token on data calls so RLS applies —
+defense in depth, not a replacement for the sole-user check.
