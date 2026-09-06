@@ -22,12 +22,38 @@ if not ALLOWED_SUPABASE_USER_ID:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-app = FastAPI()
+app = FastAPI(
+    title="Multi-Sensors Backend",
+    version="0.1.0",
+    description=(
+        "Log in via **POST /api/v1/auth/login**, copy the `access_token` from the "
+        "response, then click **Authorize** and paste it to call protected endpoints."
+    ),
+)
 
 
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {"email": "person@example.com", "password": "hunter2"}
+        }
+    }
+
+
+class LoginUser(BaseModel):
+    id: str
+    email: str | None = None
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    user: LoginUser
 
 
 @app.get('/')
@@ -42,11 +68,25 @@ async def about():
 async def health():
     return {"status": "ok"}
 
-@app.get('/api/v1/me')
+@app.get(
+    '/api/v1/me',
+    tags=["auth"],
+    summary="Current user",
+    responses={401: {"description": "Missing, malformed, or expired token"}},
+)
 async def read_me(user: dict = Depends(get_current_user)):
     return {"user_id": user["sub"], "email": user["email"]}
 
-@app.post('/api/v1/auth/login')
+@app.post(
+    '/api/v1/auth/login',
+    tags=["auth"],
+    summary="Login",
+    response_model=LoginResponse,
+    responses={
+        401: {"description": "Invalid email or password"},
+        403: {"description": "Account is not authorized"},
+    },
+)
 async def login(credentials: LoginRequest):
     try:
         result = supabase.auth.sign_in_with_password(
