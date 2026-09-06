@@ -56,6 +56,7 @@ def test_login_success(sign_in):
     )
 
     assert response.status_code == 200
+    assert calls == [{"email": "person@example.com", "password": "hunter2"}]
     assert response.json() == {
         "access_token": "access-abc",
         "refresh_token": "refresh-xyz",
