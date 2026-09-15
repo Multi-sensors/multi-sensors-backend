@@ -1,26 +1,32 @@
 import os
 
+import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response
 from pydantic import BaseModel
 from supabase import AuthApiError, Client, create_client
 
-from auth import get_current_user
+from auth import ALLOWED_SUPABASE_USER_ID, AuthenticatedUser, get_current_user
 
 load_dotenv()
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
-ALLOWED_SUPABASE_USER_ID = os.environ.get("ALLOWED_SUPABASE_USER_ID")
+# Not required yet: Supabase falls back to the redirect configured in its own Reset
+# Password email template until the frontend's reset-password page URL is finalized.
+FRONTEND_RESET_PASSWORD_URL = os.environ.get("FRONTEND_RESET_PASSWORD_URL")
 
 if not SUPABASE_URL:
     raise RuntimeError("SUPABASE_URL environment variable is not set")
 if not SUPABASE_ANON_KEY:
     raise RuntimeError("SUPABASE_ANON_KEY environment variable is not set")
-if not ALLOWED_SUPABASE_USER_ID:
-    raise RuntimeError("ALLOWED_SUPABASE_USER_ID environment variable is not set")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+SUPABASE_AUTH_URL = f"{SUPABASE_URL}/auth/v1"
+
+
+def _supabase_auth_headers(access_token: str) -> dict:
+    return {"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {access_token}"}
 
 app = FastAPI(
     title="Multi-Sensors Backend",
@@ -56,6 +62,15 @@ class LoginResponse(BaseModel):
     user: LoginUser
 
 
+class PasswordResetRequest(BaseModel):
+    email: str
+
+
+class PasswordResetConfirm(BaseModel):
+    new_password: str
+    confirm_password: str
+
+
 @app.get('/')
 async def index():
     return {"hello": "world"}
@@ -74,8 +89,8 @@ async def health():
     summary="Current user",
     responses={401: {"description": "Missing, malformed, or expired token"}},
 )
-async def read_me(user: dict = Depends(get_current_user)):
-    return {"user_id": user["sub"], "email": user["email"]}
+async def read_me(user: AuthenticatedUser = Depends(get_current_user)):
+    return {"user_id": user.id, "email": user.email}
 
 @app.post(
     '/api/v1/auth/login',
@@ -117,3 +132,67 @@ async def login(credentials: LoginRequest):
             "email": result.user.email
         }
     }
+
+@app.post(
+    '/api/v1/auth/logout',
+    tags=["auth"],
+    status_code=204,
+    summary="Logout",
+    responses={401: {"description": "Missing, malformed, or expired token"}},
+)
+async def logout(user: AuthenticatedUser = Depends(get_current_user)):
+    try:
+        response = httpx.post(
+            f"{SUPABASE_AUTH_URL}/logout",
+            params={"scope": "local"},
+            headers=_supabase_auth_headers(user.access_token),
+            timeout=10,
+        )
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Failed to revoke session") from exc
+    return Response(status_code=204)
+
+@app.post(
+    '/api/v1/auth/password-reset/request',
+    tags=["auth"],
+    status_code=202,
+    summary="Request a password reset email",
+)
+async def request_password_reset(body: PasswordResetRequest):
+    options = (
+        {"redirect_to": FRONTEND_RESET_PASSWORD_URL} if FRONTEND_RESET_PASSWORD_URL else None
+    )
+    try:
+        supabase.auth.reset_password_for_email(body.email, options=options)
+    except AuthApiError:
+        # Never reveal whether the email is registered.
+        pass
+    return {"detail": "If that email is registered, a password reset link has been sent."}
+
+@app.post(
+    '/api/v1/auth/password-reset/confirm',
+    tags=["auth"],
+    status_code=204,
+    summary="Change password (authenticated)",
+    responses={
+        400: {"description": "Passwords do not match, or do not meet Supabase's policy"},
+        401: {"description": "Missing, malformed, or expired token"},
+    },
+)
+async def confirm_password_reset(
+    body: PasswordResetConfirm, user: AuthenticatedUser = Depends(get_current_user)
+):
+    if body.new_password != body.confirm_password:
+        raise HTTPException(status_code=400, detail="Passwords do not match")
+
+    response = httpx.put(
+        f"{SUPABASE_AUTH_URL}/user",
+        json={"password": body.new_password},
+        headers=_supabase_auth_headers(user.access_token),
+        timeout=10,
+    )
+    if response.status_code >= 400:
+        raise HTTPException(status_code=400, detail="Password does not meet policy requirements")
+
+    return Response(status_code=204)

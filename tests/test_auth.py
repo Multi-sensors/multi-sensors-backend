@@ -40,3 +40,9 @@ def test_me_with_token_missing_email_claim():
     token = jwt.encode(payload, SUPABASE_JWT_SECRET, algorithm="HS256")
     response = client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 401
+
+
+def test_me_with_token_for_different_user():
+    token = make_token(sub="someone-else")
+    response = client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 403
